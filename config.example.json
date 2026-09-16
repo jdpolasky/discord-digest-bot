@@ -1,0 +1,47 @@
+{
+  "discord": {
+    "guild_id": "YOUR_GUILD_ID",
+    "token_file": "./secrets/discord_token.txt",
+    "read_channels": [
+      "general",
+      "introductions",
+      "showcase",
+      "help"
+    ]
+  },
+  "writer": {
+    "backend": "anthropic",
+    "model": "YOUR_WRITER_MODEL_ID",
+    "max_tokens": 2000,
+    "claude_cli_path": "claude"
+  },
+  "limits": {
+    "max_pings": 6,
+    "message_char_limit": 2000,
+    "max_messages": 2,
+    "min_digest_chars": 200
+  },
+  "periods": {
+    "weekly": {
+      "digest_channel_id": "YOUR_WEEKLY_DIGEST_CHANNEL_ID",
+      "armed": false,
+      "window_days": 7,
+      "anchored": false,
+      "min_messages": 0,
+      "resolve_mentions": false,
+      "channel_name": "#weekly-digest",
+      "digest_instructions": "You are writing a friendly weekly digest of a Discord community. You will be given one week of messages grouped by channel. Summarize the week's highlights: notable discussions, questions answered, wins, and new members. Write warm, concise prose in short paragraphs. Do not invent anything not in the messages. If the digest would exceed a single Discord message of 2000 characters, split it into at most two messages by placing the exact line =====SPLIT===== on its own line at the split point. Do not use @ mentions or channel links."
+    },
+    "daily": {
+      "digest_channel_id": "YOUR_DAILY_DIGEST_CHANNEL_ID",
+      "armed": false,
+      "window_days": 1,
+      "anchored": true,
+      "anchor_hour": 23,
+      "min_messages": 8,
+      "resolve_mentions": true,
+      "channel_name": "#daily-digest",
+      "digest_instructions": "You are writing a friendly daily digest of a Discord community. You will be given the last 24 hours of messages grouped by channel. Summarize the day's highlights in short, warm paragraphs. Do not invent anything not in the messages. To mention a person, write their display name in double braces like {{Alex}}; to link a channel, write {{#channel-name}}. Do not write raw Discord IDs. If the digest would exceed a single Discord message of 2000 characters, split it into at most two messages by placing the exact line =====SPLIT===== on its own line at the split point."
+    }
+  }
+}

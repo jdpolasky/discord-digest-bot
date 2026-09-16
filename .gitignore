@@ -1,0 +1,22 @@
+# Secrets: never commit the token or any real credential
+secrets/*
+!secrets/README.txt
+*.token
+discord_token.txt
+.env
+
+# Real config with your server's values (ship only config.example.json)
+config.json
+
+# Runtime output (keep the empty folders, ignore their contents)
+logs/*
+!logs/.gitkeep
+out/*
+!out/.gitkeep
+digest_work/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

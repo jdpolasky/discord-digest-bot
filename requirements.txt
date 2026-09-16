@@ -1,0 +1,3 @@
+# The Anthropic writer backend (default) needs this package.
+# The claude_cli backend needs the Claude Code CLI on PATH instead, no pip package.
+anthropic>=0.40.0
