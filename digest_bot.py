@@ -73,6 +73,7 @@ class Config:
     message_char_limit: int
     max_messages: int
     min_digest_chars: int
+    max_fetch_per_channel: int
     # Writer
     writer_backend: str
     writer_model: str
@@ -126,6 +127,7 @@ def load_config(config_path: Path, period: str) -> Config:
         message_char_limit=int(limits.get("message_char_limit", 2000)),
         max_messages=int(limits.get("max_messages", 2)),
         min_digest_chars=int(limits.get("min_digest_chars", 200)),
+        max_fetch_per_channel=int(limits.get("max_fetch_per_channel", 1000)),
         writer_backend=str(writer.get("backend", "anthropic")),
         writer_model=str(writer.get("model", "")),
         claude_cli_path=str(writer.get("claude_cli_path", "claude")),
@@ -210,6 +212,48 @@ def channel_map(cfg: Config, token: str) -> dict:
     return {c["name"].lower(): c["id"] for c in chans if c.get("type") == 0}
 
 
+def fetch_channel_messages(cfg: Config, cid: str, token: str,
+                           start: datetime) -> tuple[list, bool]:
+    """Page backward through one channel's messages, newest first.
+
+    Discord returns up to 100 messages per request, newest first. We walk
+    backward with the before=<message_id> param, page after page, and stop as
+    soon as a page reaches messages older than `start` (the window is fully
+    covered) or the channel runs out of messages. If we hit
+    cfg.max_fetch_per_channel before reaching the window start, we stop and
+    report truncation so nothing is dropped silently.
+
+    Returns (raw_messages, truncated).
+    """
+    collected: list = []
+    before: str | None = None
+    truncated = False
+    while True:
+        path = f"/channels/{cid}/messages?limit=100"
+        if before:
+            path += f"&before={before}"
+        page = api(path, token)
+        if not page:
+            break
+        collected.extend(page)
+        # Newest-first: the last item in the page is its oldest message.
+        oldest = page[-1]
+        oldest_ts = datetime.fromisoformat(oldest["timestamp"])
+        before = oldest["id"]
+        if oldest_ts < start:
+            # Paged past the start of the window; every older page is out of
+            # window. The window is fully covered, so this is not truncation.
+            break
+        if len(page) < 100:
+            # No more messages in the channel.
+            break
+        if len(collected) >= cfg.max_fetch_per_channel:
+            truncated = True
+            break
+        time.sleep(0.3)
+    return collected, truncated
+
+
 def read_window(cfg: Config, token: str) -> dict:
     start, end = window_bounds(cfg)
     chans = api(f"/guilds/{cfg.guild_id}/channels", token)
@@ -219,7 +263,9 @@ def read_window(cfg: Config, token: str) -> dict:
         cid = by_name.get(name)
         if not cid:
             continue
-        msgs = api(f"/channels/{cid}/messages?limit=100", token)
+        msgs, truncated = fetch_channel_messages(cfg, cid, token, start)
+        if truncated:
+            truncation_log(cfg, name)
         keep = []
         for m in msgs:
             ts = datetime.fromisoformat(m["timestamp"])
@@ -482,6 +528,21 @@ def success_log(cfg: Config, parts: int, chars: int) -> None:
 def quiet_skip_log(cfg: Config, total: int) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     append_log(cfg, f"- {stamp} skipped, quiet day ({total} msgs)\n")
+
+
+def truncation_log(cfg: Config, channel: str) -> None:
+    """Record that a channel hit the fetch cap before the pager reached the
+    window start, so in-window messages were left unread. This is the loud line
+    the pagination fix exists to produce; a busy channel never truncates in
+    silence."""
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    append_log(
+        cfg,
+        f"- {stamp} TRUNCATED: channel '{channel}' hit the "
+        f"max_fetch_per_channel cap of {cfg.max_fetch_per_channel} messages "
+        f"before reaching the window start; older in-window messages were not "
+        f"read. Raise limits.max_fetch_per_channel to read the full window.\n",
+    )
 
 
 def fail_log(cfg: Config, err: str) -> None:
