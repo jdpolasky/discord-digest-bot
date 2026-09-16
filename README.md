@@ -1,5 +1,7 @@
 # discord-digest-bot
 
+![discord-digest-bot banner](assets/banner.png)
+
 Your Discord server, summarized. A small bot that reads what your community talked about and posts a short summary back into the server, every day and every week.
 
 ## What it is
