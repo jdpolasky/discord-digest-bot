@@ -563,6 +563,21 @@ class ReadTests(Base):
         self.assertEqual([m["text"] for m in w["general"]], ["message 1"])
         self.assertIn("could not list active threads", self.log_text(cfg))
 
+    def test_one_thread_read_failure_warns_and_continues(self):
+        cfg = self.make_cfg("daily")
+        data = {"general": [msg(1, TODAY_START + timedelta(hours=1))]}
+        threads = [{"id": "t-broken", "name": "broken", "parent_id": "c-general"}]
+        fake = FakeDiscord(cfg, channels=data, threads=threads)
+
+        def api(path, token, method="GET", body=None):
+            if path.startswith("/channels/t-broken/"):
+                raise RuntimeError("HTTP Error 403: Forbidden")
+            return fake(path, token, method, body)
+        with mock.patch.object(db, "api", api), redirect_stderr(io.StringIO()):
+            w = db.read_window(cfg, "tok", None, (TODAY_START, END))
+        self.assertEqual([m["text"] for m in w["general"]], ["message 1"])
+        self.assertIn("could not read #general thread broken", self.log_text(cfg))
+
     def test_read_threads_off_makes_no_thread_call(self):
         cfg = self.make_cfg("daily", discord={"read_threads": False})
         _, fake, _ = self.read(cfg, {}, threads=RuntimeError("must not be called"))
@@ -779,6 +794,8 @@ class DuplicateTests(MainBase):
                             digest_text=two_part)
         self.assertEqual(got["exit"], 1)
         self.assertIn("Post failed on message 2 of 2", got["log"])
+        self.assertIn("FAILED, partly posted:", got["log"])
+        self.assertNotIn("nothing posted", got["log"])
         got = self.run_main(channels=self.busy(), armed=True, store=store, digest_text=two_part)
         self.assertEqual(got["writer"], [])
         self.assertEqual(len([m for m in store if m["content"].startswith(DAILY_HEAD)]), 1)

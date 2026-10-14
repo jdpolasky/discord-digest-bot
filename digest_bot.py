@@ -468,7 +468,14 @@ def read_window(cfg: Config, token: str, start: datetime | None = None,
             for t in threads_by_parent.get(str(cid), [])]
         keep = []
         for src_id, src_label, thread in sources:
-            msgs, truncated = fetch_channel_messages(cfg, src_id, token, start)
+            if thread is None:
+                msgs, truncated = fetch_channel_messages(cfg, src_id, token, start)
+            else:
+                try:
+                    msgs, truncated = fetch_channel_messages(cfg, src_id, token, start)
+                except Exception as e:
+                    warn(cfg, f"WARNING: could not read {src_label} ({e}); it was not read.")
+                    continue
             if truncated:
                 truncation_log(cfg, src_label)
             for m in msgs:
@@ -1364,6 +1371,10 @@ def write_digest(cfg: Config, messages: dict, authors: dict, channels: dict,
 
 # ── Post ──────────────────────────────────────────────────────────────────────
 
+class PartialPostError(RuntimeError):
+    """Raised when a later part fails after earlier parts already posted."""
+
+
 def post(cfg: Config, digest: str, token: str, authors: dict) -> int:
     """POST each part. allowed_mentions lists exactly the users a part may ping;
     with resolve_mentions off the list is empty, so nothing pings, not even a
@@ -1375,7 +1386,9 @@ def post(cfg: Config, digest: str, token: str, authors: dict) -> int:
         try:
             api(f"/channels/{cfg.digest_channel}/messages", token, "POST", body)
         except Exception as e:
-            raise RuntimeError(
+            if i == 0:
+                raise RuntimeError(f"Post failed on message 1 of {len(parts)}. {e}")
+            raise PartialPostError(
                 f"Post failed on message {i + 1} of {len(parts)}; "
                 f"{i} message(s) are already live in the channel. {e}"
             )
@@ -1435,13 +1448,15 @@ def truncation_log(cfg: Config, source: str) -> None:
     )
 
 
-def fail_log(cfg: Config, err: str) -> None:
+def fail_log(cfg: Config, err: str, partial: bool = False) -> None:
     """One FAILED line under ./logs: whitespace collapsed, reason capped near
-    300 characters. The full error still goes to stderr from main."""
+    300 characters. The full error still goes to stderr from main. A failure
+    after part of the digest already posted says so."""
     reason = " ".join(str(err).split())
     if len(reason) > 300:
         reason = reason[:297] + "..."
-    append_log(cfg, f"- {_stamp()} FAILED, nothing posted: {reason}\n")
+    what = "partly posted" if partial else "nothing posted"
+    append_log(cfg, f"- {_stamp()} FAILED, {what}: {reason}\n")
 
 
 def dry_run_note(cfg: Config, digest: str, day: str | None = None) -> Path:
@@ -1541,7 +1556,7 @@ def main(period: str, config_path: Path) -> None:
             print(f"Dry run written to {note}")
     except Exception as e:
         try:
-            fail_log(cfg, str(e))
+            fail_log(cfg, str(e), partial=isinstance(e, PartialPostError))
         except Exception as log_err:
             print(f"(could not write the FAILED log line: {log_err})", file=sys.stderr)
         print(f"DIGEST FAILED: {e}", file=sys.stderr)

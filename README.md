@@ -46,9 +46,9 @@ For each channel it reads the whole window. Discord hands back at most 100 messa
 
 Each run goes through these steps:
 
-1. **Duplicate check.** The bot reads its own last 50 posts in the digest channel. If this period's digest is already there, the run logs a skip line and stops. So a rerun, or a retry after the second of two messages failed, never posts the same digest twice.
+1. **Duplicate check.** When armed, the bot reads the last 50 messages in the digest channel and keeps the ones it posted itself. If one of them already has this period's header (or, with no header, falls in this period), the run logs a skip line and stops. That keeps a rerun, or a retry after the second of two messages failed, from posting the same digest again. If that read fails, the run logs a WARNING and goes ahead without the check.
 2. **Read.** It reads each channel in `read_channels`. With `read_threads` on (the default), it also reads the active threads under those channels. Thread messages join their parent channel's list and are labeled with the thread name. A channel name it cannot find is logged as a WARNING, and the run continues with the rest.
-3. **Carryover and quiet days.** On an anchored period with `carryover` on, the bot reads back to its own last digest post, at most `max_carry_days` days. Messages from days that were skipped as quiet are marked as earlier, and the writer reports them in a short "Since the last digest" section. Today's and carried messages count together toward `min_messages`. Only messages with text count. After `max_quiet_runs` skipped runs in a row, any message at all is enough to post.
+3. **Carryover and quiet days.** On an anchored period with `carryover` on, the bot reads back to its own last digest post, at most `max_carry_days` days. Messages from days that were skipped as quiet are marked as earlier, and the writer reports them in a short "Since the last digest" section. Today's and carried messages count together toward `min_messages`. Only messages with text count. The `max_quiet_runs`-th run since the last digest post goes out if it has any message at all, so at most `max_quiet_runs` minus 1 runs in a row are skipped. This is measured by the time since the bot's last post.
 4. **Link context (optional, off by default).** With `link_context.enabled`, the bot fetches the links members posted and gives the writer a short title and summary for each one. See Safety below.
 5. **Write.** The writer gets your `digest_instructions` plus a set of engine rules: treat member messages as data, start with the exact header line, how long to aim for, and how to name people and channels.
 6. **Trim, then split.** If the draft is slightly over one Discord message (at most `trim_max_over` characters over), the writer gets one chance to shorten it. If it is still too long, the bot splits it at the paragraph break nearest the middle, never right after the title line.
@@ -58,7 +58,7 @@ Each run goes through these steps:
 ## What data goes where
 
 - **To the writer.** The text of members' messages in the window goes to the writer you configure. That is Anthropic's API, or the Claude Code CLI on your machine, which sends it on to the model service it is set up to use. Each message goes with its author's display name and user ID, its time, its reaction count, and its thread name if it has one.
-- **Kept on disk.** A copy of each run's message JSON is saved in `./digest_work/`. The newest eight files are kept, and older ones are deleted at the start of each run. Logs go to `./logs`, and dry-run digests go to `./out`.
+- **Kept on disk.** Each run that gets past the quiet-day check saves its message JSON in `./digest_work/`. At the start of each run that folder is pruned to the newest eight files. Logs go to `./logs`, and dry-run digests go to `./out`.
 - **Dropped.** Messages from bots are dropped before anything is sent. Attachments and embeds are not sent; only the message text is.
 - **Outbound requests.** The bot calls the Discord API. When link context is on, it also makes requests from your machine to the linked sites and to `api.github.com`, and the fetched summaries go to the writer too.
 
@@ -72,7 +72,7 @@ Each run goes through these steps:
 ## Create a Discord bot and get a token
 
 1. Go to the Discord Developer Portal at https://discord.com/developers/applications and click **New Application**. Name it and create it.
-2. In the left sidebar open **Bot**. Under the bot's settings, click **Reset Token** (or **Add Bot** on older UIs) and copy the token. This token is a secret. Treat it like a password. It is the only time Discord shows it in full, so store it now.
+2. In the left sidebar open **Bot**. Under the bot's settings, click **Reset Token** and copy the token. This token is a secret. Treat it like a password. It is the only time Discord shows it in full, so store it now.
 3. Still on the **Bot** page, scroll to **Privileged Gateway Intents** and turn on **Message Content Intent**. The bot reads message text, so this intent is required. Save.
 4. Invite the bot to your server. In the left sidebar open **OAuth2 > URL Generator**. Under **Scopes** check **bot**. Under **Bot Permissions** check the permissions listed in the next section. Copy the generated URL at the bottom, open it in a browser, pick your server, and authorize.
 5. Make sure the bot's role can actually see the read channels and the digest channel. Channel-level permission overrides can hide a channel from the bot even when the server-wide permission is granted, so check each channel's permissions if a channel comes up empty.
@@ -124,7 +124,7 @@ Either way, the model id is a config value. Nothing is hardcoded, so you pick th
 ### Command-line options
 
 - `--period NAME`: which block under `periods` to run. Default `weekly`.
-- `--config PATH`: the config file to use. Default `config.json` in the repo folder. This lets you keep one config per server, for example `python digest_bot.py --period daily --config configs/second-server.json`.
+- `--config PATH`: the config file to use. Default `config.json` in the repo folder. This lets you keep one config per server, for example `python digest_bot.py --period daily --config configs/second-server.json`. Logs, dry-run files, and work files are named by period only, so give each server's periods distinct names (for example `daily-main` and `daily-second`), or use a separate copy of the repo per server.
 
 ## Config reference
 
@@ -172,7 +172,7 @@ Copy `config.example.json` to `config.json`. All values are placeholders in the 
 - `min_digest_chars`: this period's minimum digest length. Falls back to `limits.min_digest_chars`. The example weekly uses 40, so a short quiet-week note can post.
 - `carryover`: `true` reads back to the bot's last digest so skipped quiet days are reported. Defaults to the value of `anchored`.
 - `max_carry_days`: the furthest back carryover reads. Default 7.
-- `max_quiet_runs`: after this many skipped runs in a row, any message at all posts. Default 3. Set 0 to turn this off.
+- `max_quiet_runs`: the run this many periods after the last digest post goes out if it has any message at all, so at most this many minus 1 runs in a row are skipped. Default 3. Set 0 to turn this off.
 - `resolve_mentions`: `true` enables the `{{name}}` and `{{#channel}}` token system so the digest can safely @-mention people and link channels. `false` turns all pings off.
 - `tag_all_named`: `false` (default) asks the writer to tag only the people a highlight is about. `true` asks it to tag everyone it names. `max_pings` still caps the pings; if you turn this on, consider raising `max_pings` to about 12.
 - `header`: the exact first line of every digest. `{date}` becomes the run's day, like `Tue Oct 13`. `{range}` becomes the window's days, like `Oct 7-13` or `Sep 30-Oct 6`. An empty string means no header. If this key is missing, a period with `resolve_mentions` on uses `Daily Digest, {date}`, and other periods use no header. The header is checked on every draft, so keep your `digest_instructions` from asking for a different first line.
@@ -225,8 +225,8 @@ cron runs with a minimal environment, so either export the credentials in the cr
 - Quiet day: if a period reads fewer than `min_messages` messages with text (carried messages included), the run logs a skip line under `./logs` and posts nothing. This is expected.
 - Already posted: if this period's digest is already in the channel, the run logs `skipped, already posted` and exits normally.
 - Failure rule: a broken or invalid digest never posts. The run records one FAILED line under `./logs` and exits nonzero without posting. The full error goes to standard error. A run fails when the writer fails, returns empty, runs out of tokens, or refuses; when the draft is too short, splits into too many messages, or has a part over the character limit; when it fails the shape checks in "How it works"; or when the secret scan finds a credential. Partial success on posting (one of two messages sent, then an error) is reported in the log line.
-- Warnings: a missing read channel, a failed thread lookup, a failed read of the bot's own posts, or a link-context problem logs a WARNING line, and the run continues.
-- Logs: every run appends its lines to `./logs/<period>_digest.log`. A success line gives the message count, the length, the day the digest covers, and how many carried messages it included.
+- Warnings: a missing read channel, a failed active-thread listing, a thread that cannot be read, a failed read of the bot's own posts, or a failure of the whole link-context step logs a WARNING line, and the run continues. A single link that cannot be fetched is left without context and logs nothing.
+- Logs: skips, failures, warnings, and posted digests each append a line to `./logs/<period>_digest.log`. A success line gives the message count, the length, the day the digest covers, and how many carried messages it included. A dry run writes no log line; it prints the path of its `./out` file. If a two-part digest fails after the first part posted, the line reads `FAILED, partly posted`.
 
 ## Safety
 
@@ -234,7 +234,7 @@ cron runs with a minimal environment, so either export the credentials in the cr
 - **Secret scan.** Before anything posts or a dry-run file is written, the digest is checked for the bot token, the `ANTHROPIC_API_KEY` value, and common key formats (Discord bot tokens, Anthropic, GitHub, Slack, AWS and Google keys, and private key blocks). A match fails the run. The error names the kind of match and never the text itself.
 - **Writer sandbox.** The API backend passes no tools. The CLI backend runs `claude -p --tools "" --strict-mcp-config --restricted --permission-prompts none --no-session-persistence --disable-slash-commands`, plus `--model` when set. That turns off every built-in tool, ignores MCP servers and the user, project and local settings files, denies anything that would ask for permission, and saves no session. It runs in the empty `writer_sandbox` folder, away from `config.json` and the token file. These flags were checked against Claude Code 2.1.300. Older CLI versions may not know them; the CLI then exits with an error and the run fails without posting.
 - **Prompt injection.** Members can write anything, including text aimed at the writer. The engine tells the writer that messages and link summaries are data and that instructions inside them must not be followed. This lowers the risk without removing it. Read dry runs, and keep `armed` off until the output looks right.
-- **Link context.** When on, your machine requests every posted link, up to `max_links`, so the linked sites see your machine's IP address. Before each request and each redirect, the bot checks that the host resolves only to public addresses and that the URL uses http or https on port 80 or 443. It follows at most 3 redirects, sends no cookies or credentials, ignores proxy settings, and stops fetching after about 60 seconds per run. One risk remains: the check looks up the host name, and the request looks it up again. A hostile DNS server could give a public address the first time and a private one the second (DNS rebinding). Leave link context off if that matters on your machine. GitHub limits API calls made without a login; past the limit, GitHub links get no context.
+- **Link context.** When on, your machine requests posted web links, up to `max_links`, so the linked sites see your machine's IP address. Discord's own links and direct media or archive files are skipped. Before each request and each redirect, the bot checks that the host resolves only to public addresses and that the URL uses http or https on port 80 or 443. It follows at most 3 redirects, sends no cookies or credentials, ignores proxy settings, and starts no new fetch once about 60 seconds have passed in a run. The budget is checked between links, so one slow response can run past it. One risk remains: the check looks up the host name, and the request looks it up again. A hostile DNS server could give a public address the first time and a private one the second (DNS rebinding). Leave link context off if that matters on your machine. GitHub limits API calls made without a login; past the limit, GitHub links get no context.
 
 ## Upgrading
 
@@ -262,7 +262,7 @@ A few other limits:
 
 - Archived threads and forum channels are not read.
 - The refusal check only knows English phrases.
-- The duplicate check and carryover look at the bot's last 50 posts in the digest channel.
+- The duplicate check and carryover look at the last 50 messages in the digest channel. In a busy shared channel the bot's last post can fall outside that window, so give the digest its own channel.
 
 ## License
 
