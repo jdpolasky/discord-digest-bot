@@ -21,6 +21,7 @@ import tempfile
 import time as real_time
 import unittest
 import urllib.error
+import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1060,6 +1061,263 @@ class WriterBackendTests(Base):
         db.prune_work_dir()
         self.assertTrue((db.WORK_DIR / db.SANDBOX_NAME).is_dir())
         self.assertEqual(len(list(db.WORK_DIR.glob("*.json"))), 8)
+
+
+# ── 13. Link context ──────────────────────────────────────────────────────────
+
+HTML = "text/html; charset=utf-8"
+
+
+def page(title, desc="", body="", og=""):
+    meta = ""
+    if desc:
+        meta += f'<meta name="description" content="{desc}">'
+    if og:
+        meta += f"<meta property='og:description' content='{og}'>"
+    return (HTML, (f"<html><head><title>{title}</title>{meta}"
+                   f"<script>var evil = 1;</script><style>p {{color: red}}</style></head>"
+                   f"<body><p>{body}</p><script>track()</script></body></html>").encode())
+
+
+def fake_http(pages):
+    """An http_get stand-in. pages maps url to (content_type, body) or an
+    Exception; unknown urls raise. Calls are recorded in order."""
+    calls = []
+
+    def http_get(url, headers, timeout, max_bytes):
+        calls.append((url, dict(headers)))
+        got = pages.get(url)
+        if got is None:
+            raise OSError("no fake page for " + url)
+        if isinstance(got, Exception):
+            raise got
+        return got
+    return http_get, calls
+
+
+def fake_dns(table):
+    """A getaddrinfo stand-in: host -> list of address strings."""
+    def getaddrinfo(host, port, *a, **k):
+        if host not in table:
+            raise OSError("unknown host " + host)
+        return [(2, 1, 6, "", (addr, port)) for addr in table[host]]
+    return getaddrinfo
+
+
+GH_API = "https://api.github.com/repos/example-owner/example-repo"
+GH_PAGES = {GH_API: ("application/json", json.dumps({"description": "A gate for builds."}).encode()),
+            GH_API + "/readme": ("text/plain; charset=utf-8",
+                                 b"# r\n\n![badge](https://img.shields.io/x.svg)\nIt   needs a <b>signed</b> grant.")}
+
+
+class LinkTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.cfg = self.make_cfg("daily", link_context={"enabled": True})
+
+    def enrich(self, messages, pages):
+        http_get, calls = fake_http(pages)
+        with mock.patch.object(db, "http_get", http_get):
+            return db.enrich_links(messages, self.cfg), calls
+
+    def test_extract_urls(self):
+        got = db.extract_urls("see https://a.example/x, then <https://b.example/y?q=1>. "
+                              "(also http://c.example/z) and https://wiki.example/F_(b).")
+        self.assertEqual(got, ["https://a.example/x", "https://b.example/y?q=1",
+                               "http://c.example/z", "https://wiki.example/F_(b)"])
+        self.assertEqual(db.extract_urls("no links, just www and http talk"), [])
+
+    def test_skip_list(self):
+        for u in ("https://discord.com/channels/1/2/3", "https://ptb.discord.com/x",
+                  "https://cdn.discordapp.com/attachments/a.txt", "https://media.discordapp.net/a",
+                  "https://x.example/pic.PNG", "https://x.example/v.mp4", "https://x.example/r.tar.gz",
+                  "https://x.example/p.jpeg?width=400"):
+            self.assertTrue(db.skip_url(u), u)
+        for u in ("https://blog.example/post/", "https://github.com/a/b",
+                  "https://x.example/zipcode", "https://notdiscord.com/x"):
+            self.assertFalse(db.skip_url(u), u)
+
+    def test_github_repo(self):
+        self.assertEqual(db.github_repo("https://github.com/example-owner/example-repo"),
+                         ("example-owner", "example-repo"))
+        self.assertEqual(db.github_repo("https://github.com/someone/tool/tree/main/src/x.py"),
+                         ("someone", "tool"))
+        self.assertEqual(db.github_repo("https://www.github.com/a/b.git"), ("a", "b"))
+        self.assertIsNone(db.github_repo("https://github.com/someone"))
+        self.assertIsNone(db.github_repo("https://github.com/orgs/foo/people"))
+        self.assertIsNone(db.github_repo("https://gitlab.com/a/b"))
+
+    def test_github_context(self):
+        msgs = {"wins": [{"text": "look https://github.com/example-owner/example-repo/blob/main/README.md"}]}
+        added, calls = self.enrich(msgs, GH_PAGES)
+        ctx = msgs["wins"][0]["link_context"][0]
+        self.assertEqual(added, 1)
+        self.assertEqual([c[0] for c in calls], [GH_API, GH_API + "/readme"])
+        self.assertEqual(calls[1][1]["Accept"], "application/vnd.github.raw")
+        self.assertEqual(calls[0][1]["User-Agent"], "discord-digest-bot link preview")
+        self.assertEqual(ctx["title"], "example-owner/example-repo")
+        self.assertTrue(ctx["summary"].startswith("A gate for builds."))
+        self.assertIn("It needs a signed grant.", ctx["summary"])
+        self.assertNotIn("shields", ctx["summary"])
+
+    def test_html_context(self):
+        t, s = db.html_context(page("Clef &amp; Co", desc="Decision models.", body="Hello   <b>there</b>")[1].decode())
+        self.assertEqual((t, s), ("Clef & Co", "Decision models. Hello there"))
+        t, s = db.html_context(page("T", og="OG words", body="Body")[1].decode())
+        self.assertEqual(s, "OG words Body")
+        self.assertFalse(any(w in s for w in ("evil", "track", "color")))
+
+    def test_non_html_gives_no_context(self):
+        m = {"c": [{"text": "https://x.example/data"}]}
+        added, _ = self.enrich(m, {"https://x.example/data": ("application/json", b"{}")})
+        self.assertEqual(added, 0)
+        self.assertNotIn("link_context", m["c"][0])
+
+    def test_clean_link_text(self):
+        sample = ("# \U0001F427⚡ Build Gate\n\n"
+                  "[![CI](https://img.shields.io/ci.svg)](https://ci.example) ![logo](logo.png)\n\n"
+                  "> > **Note:** beta\n\n---\n\n"
+                  "A tool that checks a [signed grant](https://docs.example/grant) before a program runs.\n\n"
+                  "Title\n=====\n\n```bash\nmake install\n```\n\n* * *\n___\n"
+                  "Built by Zoë in Malmö, café-tested ✅ 100%.\n"
+                  "<img src=\"x.png\"> <!-- hidden -->Done.‍️")
+        want = ("Build Gate Note: beta A tool that checks a signed grant before a program runs. "
+                "Title make install Built by Zoë in Malmö, café-tested 100%. Done.")
+        self.assertEqual(db.clean_link_text(sample), want)
+        r3 = ("**We taught builds** to ask. __Bold too__, *one* and _two_.\n"
+              "REQUEST → MEASURE ↓ PROVE ⟶ PERMIT ⤅ RUN\n"
+              "See build-gate and pre_exec_gate_v2; 2 * 3 stays.")
+        self.assertEqual(db.clean_link_text(r3),
+                         "We taught builds to ask. Bold too, one and two. "
+                         "REQUEST MEASURE PROVE PERMIT RUN See build-gate and pre_exec_gate_v2; 2 * 3 stays.")
+
+    def test_summary_cap(self):
+        m = {"c": [{"text": "https://long.example/"}]}
+        self.enrich(m, {"https://long.example/": page("L", body="word " * 5000)})
+        s = m["c"][0]["link_context"][0]["summary"]
+        self.assertTrue(2400 < len(s) <= 2500)
+
+    def test_http_get_caps(self):
+        seen = {}
+
+        class FakeResp:
+            headers = {"Content-Type": HTML}
+
+            def read(self, n=-1):
+                seen["n"] = n
+                return b"x" * n
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        opener = SimpleNamespace(open=lambda req, timeout=None: (seen.__setitem__("t", timeout)
+                                                                 or seen.__setitem__("req", req)
+                                                                 or FakeResp()))
+        with mock.patch.object(db, "_link_opener", lambda: opener), \
+                mock.patch("socket.getaddrinfo", fake_dns({"cap.example": ["93.184.216.34"]})):
+            ctype, body = db.http_get("https://cap.example/", {"User-Agent": "t"}, 10, 200_000)
+        self.assertEqual((seen["n"], len(body), seen["t"], ctype), (200_000, 200_000, 10, HTML))
+        self.assertIsNone(seen["req"].get_header("Cookie"))
+        self.assertIsNone(seen["req"].get_header("Authorization"))
+
+    def test_eight_link_cap_and_dedupe(self):
+        urls = [f"https://site{i}.example/" for i in range(10)]
+        pages = {u: page(f"Site {i}") for i, u in enumerate(urls)}
+        m = {"general": [{"text": "https://cdn.discordapp.com/a.png " + urls[0] + " " + urls[1]},
+                         {"text": urls[0] + " again"}],
+             "help": [{"text": " ".join(urls[2:])}]}
+        added, calls = self.enrich(m, pages)
+        self.assertEqual(added, 8)
+        self.assertEqual([c[0] for c in calls], urls[:8])
+        self.assertNotIn("link_context", m["general"][1])
+        self.assertEqual([c["url"] for c in m["help"][0]["link_context"]], urls[2:8])
+
+    def test_time_budget(self):
+        clock = iter([0, 0, 61, 61, 61])
+        m = {"c": [{"text": "https://a.example/ https://b.example/"}]}
+        with mock.patch.object(db, "time", SimpleNamespace(monotonic=lambda: next(clock),
+                                                           sleep=lambda s: None)):
+            added, calls = self.enrich(m, {"https://a.example/": page("A"),
+                                           "https://b.example/": page("B")})
+        self.assertEqual([c[0] for c in calls], ["https://a.example/"])
+
+    def test_fetch_errors_never_raise(self):
+        m = {"c": [{"text": "https://boom.example/ and https://ok.example/"}]}
+        added, _ = self.enrich(m, {"https://boom.example/": TimeoutError("timed out"),
+                                   "https://ok.example/": page("OK")})
+        self.assertEqual(added, 1)
+        m = {"c": [{"text": "https://github.com/example-owner/example-repo"}]}
+        added, _ = self.enrich(m, {GH_API: OSError("rate limited")})
+        self.assertEqual(added, 0)
+
+    # SSRF guard
+    def test_guard_blocks_private_and_odd_urls(self):
+        dns = fake_dns({"internal.example": ["10.1.2.3"], "mixed.example": ["93.184.216.34", "192.168.0.5"],
+                        "public.example": ["93.184.216.34"], "v6.example": ["2606:4700::1111"]})
+        with mock.patch("socket.getaddrinfo", dns):
+            for u in ("http://127.0.0.1/", "http://10.0.0.8/", "http://169.254.169.254/latest/meta-data",
+                      "http://[::1]/", "http://[::ffff:10.0.0.1]/", "http://[::ffff:127.0.0.1]/",
+                      "https://internal.example/", "https://mixed.example/",
+                      "https://public.example:8080/", "file:///etc/passwd", "ftp://public.example/",
+                      "https://user:pw@public.example/", "http://224.0.0.1/", "https://nowhere.example/"):
+                self.assertFalse(db.url_allowed(u), u)
+            for u in ("https://public.example/", "http://public.example:80/x",
+                      "https://public.example:443/", "https://v6.example/", "https://93.184.216.34/"):
+                self.assertTrue(db.url_allowed(u), u)
+
+    def test_guard_on_redirect(self):
+        dns = fake_dns({"public.example": ["93.184.216.34"], "internal.example": ["10.1.2.3"]})
+        h = db._GuardedRedirect()
+        req = urllib.request.Request("https://public.example/")
+        with mock.patch("socket.getaddrinfo", dns):
+            with self.assertRaises(urllib.error.URLError):
+                h.redirect_request(req, None, 302, "Found", {}, "https://internal.example/")
+            ok = h.redirect_request(req, None, 302, "Found", {}, "https://public.example/next")
+        self.assertEqual(ok.full_url, "https://public.example/next")
+        self.assertEqual(db._GuardedRedirect.max_redirections, 3)
+
+    def test_http_get_refuses_blocked_url(self):
+        with mock.patch.object(db, "_link_opener", _forbid("_link_opener")):
+            with self.assertRaises(urllib.error.URLError):
+                db.http_get("http://127.0.0.1:80/", {}, 10, 100)
+
+    def test_opener_has_no_cookie_or_file_handlers(self):
+        names = {type(h).__name__ for h in db._link_opener().handlers}
+        self.assertFalse(names & {"HTTPCookieProcessor", "FileHandler", "FTPHandler",
+                                  "HTTPBasicAuthHandler", "ProxyBasicAuthHandler"})
+        self.assertIn("_GuardedRedirect", names)
+
+
+
+class LinkMainTests(MainBase):
+    def linked(self):
+        data = self.busy(8)
+        data["general"][0]["content"] = "my tool https://github.com/example-owner/example-repo"
+        return data
+
+    def test_main_hands_writer_link_context(self):
+        http_get, _ = fake_http(GH_PAGES)
+        with mock.patch.object(db, "http_get", http_get):
+            got = self.run_main(channels=self.linked(), link_context={"enabled": True})
+        system, user = got["writer"][0]
+        self.assertIn('"link_context"', user)
+        self.assertIn("example-owner/example-repo", user)
+        self.assertIn("link_context: the fetched title", system)
+
+    def test_off_by_default_means_no_fetch(self):
+        with mock.patch.object(db, "http_get", _forbid("http_get")):
+            got = self.run_main(channels=self.linked())
+        self.assertNotIn("exit", got, got["stderr"])
+        self.assertNotIn('"link_context"', got["writer"][0][1])
+
+    def test_every_fetch_failing_still_writes(self):
+        http_get, _ = fake_http({k: OSError("down") for k in GH_PAGES})
+        with mock.patch.object(db, "http_get", http_get):
+            got = self.run_main(channels=self.linked(), link_context={"enabled": True})
+        self.assertEqual(len(got["dry"]), 1)
 
 
 if __name__ == "__main__":

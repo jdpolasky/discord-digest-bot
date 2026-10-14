@@ -750,6 +750,293 @@ def resolve_mentions(text: str, authors: dict, channels: dict | None,
     return text
 
 
+# ── Link context (opt-in) ─────────────────────────────────────────────────────
+# With link_context.enabled, the script (never the writer) fetches each link
+# members posted and puts a short title and summary beside the message, so the
+# writer can say what was shared. Any trouble with a link means that link gets
+# no context; a link problem never fails the run.
+
+LINK_UA = "discord-digest-bot link preview"
+LINK_BUDGET_SECONDS = 60   # total time spent fetching links in one run
+LINK_MAX_REDIRECTS = 3
+_URL_RE = re.compile(r"https?://[^\s<>\"'`|]+", re.IGNORECASE)
+_SKIP_HOSTS = ("discord.com", "discordapp.com", "cdn.discordapp.com", "media.discordapp.net")
+_SKIP_EXTS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".tif", ".tiff",
+    ".heic", ".avif",                                                      # image
+    ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".wmv", ".flv",       # video
+    ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus", ".wma",      # audio
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".zst",   # archive
+)
+_GH_NOT_OWNERS = {"orgs", "settings", "features", "marketplace", "topics", "sponsors",
+                  "apps", "login", "join", "explore", "collections", "trending", "about",
+                  "pricing", "enterprise", "search", "notifications", "pulls", "issues",
+                  "codespaces", "events", "site", "security", "customer-stories"}
+
+
+def extract_urls(text: str) -> list:
+    """http(s) URLs in text, in order, with trailing punctuation trimmed."""
+    out = []
+    for u in _URL_RE.findall(text or ""):
+        u = u.rstrip(".,;:!?*_~")
+        while u.endswith(")") and u.count(")") > u.count("("):
+            u = u[:-1]  # "(see https://x.y/z)" keeps its own parens only
+        u = u.rstrip(".,;:!?*_~]}>")
+        if len(u) > len("https://"):
+            out.append(u)
+    return out
+
+
+def skip_url(url: str) -> bool:
+    """True for Discord's own links and direct media or archive files."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return True
+    host = (parts.hostname or "").lower()
+    if not host:
+        return True
+    if any(host == h or host.endswith("." + h) for h in _SKIP_HOSTS):
+        return True
+    return parts.path.lower().endswith(_SKIP_EXTS)
+
+
+def github_repo(url: str) -> tuple | None:
+    """(owner, repo) for a github.com/<owner>/<repo>[/anything] URL, else None."""
+    parts = urllib.parse.urlsplit(url)
+    if (parts.hostname or "").lower() not in ("github.com", "www.github.com"):
+        return None
+    segs = [s for s in parts.path.split("/") if s]
+    if len(segs) < 2 or segs[0].lower() in _GH_NOT_OWNERS:
+        return None
+    repo = segs[1][:-4] if segs[1].lower().endswith(".git") else segs[1]
+    if not re.fullmatch(r"[A-Za-z0-9-]+", segs[0]) or not re.fullmatch(r"[A-Za-z0-9._-]+", repo):
+        return None
+    return segs[0], repo
+
+
+def _ip_allowed(ip) -> bool:
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
+
+
+def url_allowed(url: str) -> bool:
+    """The guard on every link fetch, redirects included. Only http and https
+    on the default ports, no user:password in the URL, and every address the
+    host resolves to must be a public (global, non-multicast) address. This
+    keeps a posted link from reaching the machine itself or its local network."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or port not in (None, 80, 443):
+        return False
+    if parts.username or parts.password:
+        return False
+    host = parts.hostname
+    if not host:
+        return False
+    try:
+        return _ip_allowed(ipaddress.ip_address(host))
+    except ValueError:
+        pass  # a name, not an address literal
+    try:
+        infos = socket.getaddrinfo(host, port or (443 if scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+        except ValueError:
+            return False
+        if not _ip_allowed(ip):
+            return False
+    return True
+
+
+class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows at most LINK_MAX_REDIRECTS redirects and re-checks every hop."""
+    max_redirections = LINK_MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not url_allowed(newurl):
+            raise urllib.error.URLError("link redirect to a blocked address")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _link_opener() -> urllib.request.OpenerDirector:
+    """An opener with only what link fetches need: http, https and the guarded
+    redirect handler. No cookie handling, no auth handlers, no file: or ftp:,
+    and no proxy, so the guard's DNS answer is the address actually used."""
+    opener = urllib.request.OpenerDirector()
+    for h in (urllib.request.ProxyHandler({}), urllib.request.HTTPHandler(),
+              urllib.request.HTTPSHandler(), urllib.request.HTTPDefaultErrorHandler(),
+              _GuardedRedirect(), urllib.request.HTTPErrorProcessor()):
+        opener.add_handler(h)
+    return opener
+
+
+def http_get(url: str, headers: dict, timeout: float, max_bytes: int) -> tuple:
+    """The one network edge for link context: (content-type, body), body capped
+    at max_bytes. Raises on any failure, including a blocked address."""
+    if not url_allowed(url):
+        raise urllib.error.URLError("link to a blocked address")
+    req = urllib.request.Request(url, headers=headers)
+    with _link_opener().open(req, timeout=timeout) as r:
+        return r.headers.get("Content-Type", "") or "", r.read(max_bytes)
+
+
+def _decode(ctype: str, body: bytes) -> str:
+    m = re.search(r"charset=([\w-]+)", ctype or "", re.IGNORECASE)
+    try:
+        return body.decode(m.group(1) if m else "utf-8", errors="replace")
+    except LookupError:
+        return body.decode("utf-8", errors="replace")
+
+
+_LINK_DROP_CATS = {"So", "Sk", "Cs", "Co"}  # emoji and symbols
+_LINK_DROP_CHARS = {chr(0xFE0E), chr(0xFE0F), chr(0x200D)}
+_RULE_LINE = re.compile(r"^\s*([-=*_])(\s*\1){2,}\s*$")
+
+
+def _is_arrow(c: str) -> bool:
+    """Arrows block U+2190-21FF, Supplemental Arrows-A U+27F0-27FF and -B U+2900-297F."""
+    o = ord(c)
+    return 0x2190 <= o <= 0x21FF or 0x27F0 <= o <= 0x27FF or 0x2900 <= o <= 0x297F
+
+
+def clean_link_text(text: str) -> str:
+    """Plain words from fetched README or page text, before the length cut.
+    Drops markdown images, keeps link text only, drops HTML tags, heading and
+    blockquote marks, rule lines, code-fence lines, bold and italic marks,
+    emoji, symbols and arrows; collapses spaces. Underscores inside words and
+    identifiers stay."""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text or "")       # images and badges
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)           # [text](url) -> text
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)                            # HTML tags
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("```") or _RULE_LINE.match(s):
+            continue
+        s = re.sub(r"^(>\s*)+", "", s)                              # blockquote marks
+        s = re.sub(r"^#+\s*", "", s)                                # heading marks
+        lines.append(s)
+    text = "\n".join(lines)
+    text = re.sub(r"\*\*(?=\S)([^\n]+?)(?<=\S)\*\*", r"\1", text)
+    text = re.sub(r"(?<!\w)__(?=\S)([^\n]+?)(?<=\S)__(?!\w)", r"\1", text)
+    text = re.sub(r"(?<![\w*])\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?![\w*])", r"\1", text)
+    text = re.sub(r"(?<!\w)_(?=[^\s_])([^_\n]+?)(?<=[^\s_])_(?!\w)", r"\1", text)
+    text = "".join(c for c in text if c not in _LINK_DROP_CHARS
+                   and unicodedata.category(c) not in _LINK_DROP_CATS
+                   and not _is_arrow(c))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _clip(text: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit - 3].rstrip() + "..."
+
+
+def html_context(doc: str, limit: int = 2500) -> tuple:
+    """(title, summary) from an HTML page: <title>; meta description or
+    og:description, then the start of the visible text."""
+    m = re.search(r"<title[^>]*>(.*?)</title>", doc, re.IGNORECASE | re.DOTALL)
+    title = _clip(html.unescape(m.group(1)), 200) if m else ""
+    desc = og = ""
+    for tag in re.findall(r"<meta\b[^>]*>", doc, re.IGNORECASE):
+        attrs = {k.lower(): (v1 if v1 or not v2 else v2)
+                 for k, _, v1, v2 in re.findall(
+                     r"""([\w:-]+)\s*=\s*("([^"]*)"|'([^']*)')""", tag)}
+        key = (attrs.get("name") or attrs.get("property") or "").lower()
+        if key == "description" and not desc:
+            desc = attrs.get("content", "")
+        elif key == "og:description" and not og:
+            og = attrs.get("content", "")
+    lead = html.unescape(desc or og).strip()
+    body = re.sub(r"<!--.*?-->", " ", doc, flags=re.DOTALL)
+    body = re.sub(r"<(script|style|noscript|head|svg)\b.*?</\1\s*>", " ", body,
+                  flags=re.IGNORECASE | re.DOTALL)
+    body = re.sub(r"<[^>]+>", "\n", body)
+    visible = html.unescape(body)
+    summary = (lead + "\n" + visible) if lead else visible
+    return title, _clip(clean_link_text(summary), limit)
+
+
+def fetch_link_context(cfg: Config, url: str) -> dict | None:
+    """{"url", "title", "summary"} for one link, or None. Never raises."""
+    t, cap, lim = cfg.link_timeout_seconds, cfg.link_max_bytes, cfg.link_summary_chars
+    try:
+        gh = github_repo(url)
+        if gh:
+            owner, repo = gh
+            api_base = f"https://api.github.com/repos/{owner}/{repo}"
+            _, raw = http_get(api_base, {"User-Agent": LINK_UA,
+                                         "Accept": "application/vnd.github+json"}, t, cap)
+            desc = (json.loads(raw.decode("utf-8", errors="replace")).get("description")
+                    or "").strip()
+            try:  # a repo with no README still has its description
+                ctype, rb = http_get(api_base + "/readme", {
+                    "User-Agent": LINK_UA, "Accept": "application/vnd.github.raw"}, t, cap)
+                readme = _decode(ctype, rb)
+            except Exception:
+                readme = ""
+            summary = _clip(clean_link_text(desc + "\n" + readme), lim)
+            if not summary:
+                return None
+            return {"url": url, "title": f"{owner}/{repo}", "summary": summary}
+        ctype, body = http_get(url, {"User-Agent": LINK_UA, "Accept": "text/html"}, t, cap)
+        if not ctype.lower().startswith("text/html"):
+            return None
+        title, summary = html_context(_decode(ctype, body), lim)
+        if not (title or summary):
+            return None
+        return {"url": url, "title": title, "summary": summary}
+    except Exception:
+        return None
+
+
+def enrich_links(messages: dict, cfg: Config) -> int:
+    """Add "link_context" to messages that post http(s) links, in place.
+
+    At most link_context.max_links distinct URLs are fetched per run, first
+    seen wins; a URL seen again is not fetched or attached again. Skipped links
+    (Discord, media, archives) do not count toward the cap. Fetching stops once
+    LINK_BUDGET_SECONDS have passed. Returns the number of contexts added.
+    """
+    seen: set = set()
+    fetched = added = 0
+    began = time.monotonic()
+    for msgs in messages.values():
+        for m in msgs:
+            ctx = []
+            for url in extract_urls(m.get("text", "")):
+                if url in seen or skip_url(url):
+                    continue
+                seen.add(url)
+                if fetched >= cfg.link_max_links:
+                    continue
+                if time.monotonic() - began > LINK_BUDGET_SECONDS:
+                    continue
+                fetched += 1
+                c = fetch_link_context(cfg, url)
+                if c:
+                    ctx.append(c)
+            if ctx:
+                m["link_context"] = ctx
+                added += len(ctx)
+    return added
+
+
 # ── LLM writer ────────────────────────────────────────────────────────────────
 
 def engine_rules(cfg: Config, header: str, earlier_total: int = 0,
@@ -1221,6 +1508,14 @@ def main(period: str, config_path: Path) -> None:
         carry_lbl = carry_day = None
         if earlier_total > 0 and carry_start is not None:
             carry_lbl, carry_day = carry_label(cfg, carry_start)
+
+        if cfg.link_enabled:
+            # Fetch posted links so the writer can say what was shared. A link
+            # problem never fails the run.
+            try:
+                enrich_links(messages, cfg)
+            except Exception as e:
+                warn(cfg, f"WARNING: link context skipped ({e}).")
 
         # Keep a copy of the raw JSON for debugging.
         src_json = WORK_DIR / f"{cfg.period}_{day_str}.json"
