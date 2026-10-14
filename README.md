@@ -2,6 +2,8 @@
 
 ![discord-digest-bot banner](assets/banner.png)
 
+> Built by [Joshua Polasky](https://github.com/jdpolasky), a strategy and operations consultant. Business first, then AI. [How I work with businesses](https://github.com/jdpolasky/jdpolasky/blob/main/HOW-I-WORK.md) · joshua.polasky@gmail.com
+
 Your Discord server, summarized. A small bot that reads what your community talked about and posts a short summary back into the server, every day and every week.
 
 ## What it is
@@ -113,7 +115,7 @@ Either way, the model id is a config value. Nothing is hardcoded, so you pick th
 
 ## Setup
 
-1. Clone or download this repo.
+1. Clone or download this repo from https://github.com/jdpolasky/discord-digest-bot.
 2. Install dependencies (for the default Anthropic writer): `pip install -r requirements.txt`.
 3. Copy `config.example.json` to `config.json` and fill in your values (see the config reference below).
 4. Put your Discord bot token in `./secrets/discord_token.txt` or set the `DISCORD_BOT_TOKEN` environment variable.
@@ -263,6 +265,10 @@ A few other limits:
 - Archived threads and forum channels aren't read.
 - The refusal check only knows English phrases.
 - The duplicate check and carryover look at the last 50 messages in the digest channel. In a busy shared channel the bot's last post can fall outside that window, so give the digest its own channel.
+
+## Who made this
+
+Built by Joshua Polasky, a strategy and operations consultant. Business first, then AI. If you're an owner or leader who wants help figuring out where AI fits in your business, get in touch: joshua.polasky@gmail.com or [LinkedIn](https://linkedin.com/in/joshuapolasky).
 
 ## License
 
