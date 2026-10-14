@@ -1022,7 +1022,7 @@ class WriterBackendTests(Base):
         self.assertIn("Tag every person you name, once.", system)
         self.assertEqual(cfg.max_pings, 6)
 
-    def cli_call(self, rc=0, stdout="the digest", **over):
+    def cli_call(self, rc=0, stdout="the digest", which_result=None, **over):
         cfg = self.make_cfg("daily", writer={"backend": "claude_cli", "model": "opus"}, **over)
         seen = {}
 
@@ -1032,7 +1032,8 @@ class WriterBackendTests(Base):
             return SimpleNamespace(returncode=rc, stdout=stdout, stderr="bad things")
         (db.WORK_DIR / db.SANDBOX_NAME).mkdir(parents=True)
         (db.WORK_DIR / db.SANDBOX_NAME / "leftover.txt").write_text("x", encoding="utf-8")
-        with mock.patch("subprocess.run", run):
+        with mock.patch("subprocess.run", run), \
+                mock.patch("shutil.which", lambda name: which_result):
             got = db.write_via_claude_cli(cfg, "SYSTEM\nline two", "USER")
         return got, seen
 
@@ -1055,6 +1056,11 @@ class WriterBackendTests(Base):
         self.assertTrue(seen["sandbox_empty"])
         self.assertEqual((kw["encoding"], kw["errors"]), ("utf-8", "replace"))
         self.assertEqual(kw["timeout"], 600)
+
+    def test_cli_path_resolved_on_path(self):
+        # A Windows npm install is claude.cmd; the bare name must be resolved first.
+        _, seen = self.cli_call(which_result=r"C:\tools\npm\claude.cmd")
+        self.assertEqual(seen["args"][0], r"C:\tools\npm\claude.cmd")
 
     def test_cli_nonzero_exit_raises(self):
         with self.assertRaises(RuntimeError) as ctx:

@@ -1176,7 +1176,10 @@ def write_via_claude_cli(cfg: Config, system: str, user: str) -> str:
     if sandbox.exists():
         shutil.rmtree(sandbox)
     sandbox.mkdir(parents=True)
-    cmd = [cfg.claude_cli_path, "-p", "--tools", "", "--strict-mcp-config", "--restricted",
+    # An npm install of Claude Code on Windows is claude.cmd, which a bare
+    # "claude" in subprocess cannot start; resolve it on PATH first.
+    exe = shutil.which(cfg.claude_cli_path) or cfg.claude_cli_path
+    cmd = [exe, "-p", "--tools", "", "--strict-mcp-config", "--restricted",
            "--permission-prompts", "none", "--no-session-persistence",
            "--disable-slash-commands"]
     if cfg.writer_model:
