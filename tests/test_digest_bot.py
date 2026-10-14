@@ -493,5 +493,574 @@ class SecretScanTests(Base):
         self.assertFalse(self.blocks("plain text", ["", None]))
 
 
+# ── 5. Reading ────────────────────────────────────────────────────────────────
+
+class ReadTests(Base):
+    def read(self, cfg, data, start=None, **env):
+        fake = FakeDiscord(cfg, channels=data, **env)
+        err = io.StringIO()
+        with mock.patch.object(db, "api", fake), redirect_stderr(err):
+            w = db.read_window(cfg, "tok", start, (TODAY_START, END))
+        return w, fake, err.getvalue()
+
+    def test_earlier_flag_drops_and_order(self):
+        cfg = self.make_cfg("daily")
+        carry = TODAY_START - timedelta(days=1)
+        data = {
+            "general": [msg(1, TODAY_START + timedelta(hours=2)),
+                        msg(2, TODAY_START - timedelta(hours=3)),
+                        msg(3, TODAY_START),                       # exactly the start: earlier
+                        msg(4, TODAY_START + timedelta(hours=1), bot=True),
+                        msg(5, carry - timedelta(hours=1))],       # before carry start
+            "help": [msg(6, END), msg(7, END + timedelta(minutes=1))],
+        }
+        w, _, _ = self.read(cfg, data, carry)
+        by_text = {m["text"]: m for v in w.values() for m in v}
+        self.assertEqual(set(by_text), {"message 1", "message 2", "message 3", "message 6"})
+        self.assertTrue(by_text["message 2"]["earlier"] and by_text["message 3"]["earlier"])
+        self.assertNotIn("earlier", by_text["message 1"])
+        self.assertNotIn("earlier", by_text["message 6"])
+        self.assertEqual([m["text"] for m in w["general"]], ["message 2", "message 3", "message 1"])
+        w, _, _ = self.read(cfg, data)
+        self.assertEqual({m["text"] for v in w.values() for m in v}, {"message 1", "message 6"})
+
+    def test_missing_channel_warns_and_continues(self):
+        cfg = self.make_cfg("daily")
+        data = {"general": [msg(1, TODAY_START + timedelta(hours=1))]}
+        w, _, err = self.read(cfg, data, names=["general", "help-desk"])
+        self.assertEqual(list(w), ["general"])
+        self.assertIn("WARNING: #help", err)
+        self.assertIn("WARNING: #help", self.log_text(cfg))
+
+    def test_threads_merged_labeled_and_scoped(self):
+        cfg = self.make_cfg("daily")
+        data = {"general": [msg(1, TODAY_START + timedelta(hours=1)),
+                            msg(3, TODAY_START + timedelta(hours=3))],
+                "deep-dive": [msg(2, TODAY_START + timedelta(hours=2))],
+                "off-list": [msg(4, TODAY_START + timedelta(hours=4))]}
+        threads = [{"id": "t-deep-dive", "name": "deep-dive", "parent_id": "c-general"},
+                   {"id": "t-off-list", "name": "off-list", "parent_id": "c-random"}]
+        w, _, _ = self.read(cfg, data, threads=threads)
+        got = w["general"]
+        self.assertEqual([m["text"] for m in got], ["message 1", "message 2", "message 3"])
+        self.assertEqual(got[1]["thread"], "deep-dive")
+        self.assertNotIn("thread", got[0])
+        self.assertNotIn("message 4", json.dumps(w))
+
+    def test_thread_lookup_failure_warns(self):
+        cfg = self.make_cfg("daily")
+        data = {"general": [msg(1, TODAY_START + timedelta(hours=1))]}
+        w, _, _ = self.read(cfg, data, threads=RuntimeError("threads down"))
+        self.assertEqual([m["text"] for m in w["general"]], ["message 1"])
+        self.assertIn("could not list active threads", self.log_text(cfg))
+
+    def test_read_threads_off_makes_no_thread_call(self):
+        cfg = self.make_cfg("daily", discord={"read_threads": False})
+        _, fake, _ = self.read(cfg, {}, threads=RuntimeError("must not be called"))
+        self.assertFalse(any("threads/active" in p for _, p in fake.calls))
+
+    def test_substantive_counts(self):
+        got = db.substantive_counts({"c": [{"text": "a"}, {"text": ""}, {"text": "b", "earlier": True},
+                                           {"text": " ", "earlier": True}]})
+        self.assertEqual(got, (1, 1))
+
+
+# ── 6. Carryover and quiet runs ───────────────────────────────────────────────
+
+class CarryTests(Base):
+    def test_carry_start_for(self):
+        f = db.carry_start_for
+        self.assertEqual(f(TODAY_START, END, TODAY_START + timedelta(seconds=5), 7), TODAY_START)
+        two = TODAY_START - timedelta(days=1) + timedelta(seconds=5)
+        self.assertEqual(f(TODAY_START, END, two, 7), two)
+        self.assertEqual(f(TODAY_START, END, END - timedelta(days=20), 7), END - timedelta(days=7))
+        self.assertEqual(f(TODAY_START, END, END - timedelta(days=20), 3), END - timedelta(days=3))
+        self.assertEqual(f(TODAY_START, END, None, 7), TODAY_START)
+
+    def test_quiet_skip(self):
+        cfg = self.make_cfg("daily")
+        qs = db.quiet_skip
+        two_back = END - timedelta(days=2) + timedelta(minutes=2)
+        three_back = END - timedelta(days=3) + timedelta(minutes=2)
+        self.assertFalse(qs(cfg, 2, 6, END, two_back))        # 8 together posts
+        self.assertTrue(qs(cfg, 2, 5, END, two_back))         # 7, last post 2 back
+        self.assertFalse(qs(cfg, 1, 2, END, three_back))      # 3 runs back: anything posts
+        self.assertTrue(qs(cfg, 0, 0, END, END - timedelta(days=7)))  # zero never posts
+        self.assertTrue(qs(cfg, 1, 2, END, None))             # no last post: count rule
+        self.assertFalse(qs(cfg, 3, 5, END, None))
+        off = self.make_cfg("daily", max_quiet_runs=0)
+        self.assertTrue(qs(off, 1, 2, END, END - timedelta(days=5)))
+        wk = self.make_cfg("weekly")
+        self.assertFalse(qs(wk, 0, 0, None, None))
+
+    @unittest.skipUnless(CHI is not None, "tzdata for America/Chicago not available")
+    def test_carry_label_across_anchor(self):
+        cfg = self.make_cfg("daily")
+        at = datetime(2026, 9, 27, 23, 0).replace(tzinfo=CHI)
+        self.assertEqual(db.carry_label(cfg, at, tz=CHI), ("Mon Sep 28", "2026-09-28"))
+        before = datetime(2026, 9, 27, 22, 0).replace(tzinfo=CHI)
+        self.assertEqual(db.carry_label(cfg, before, tz=CHI), ("Sun Sep 27", "2026-09-27"))
+
+    def test_carry_paragraph_only_with_earlier(self):
+        cfg = self.make_cfg("daily")
+        s0, _ = db.build_prompt(cfg, {}, DAILY_HEAD, 0, None)
+        s2, _ = db.build_prompt(cfg, {}, DAILY_HEAD, 2, "Mon Sep 28")
+        self.assertNotIn("Since the last digest", s0)
+        self.assertIn("Since the last digest", s2)
+        self.assertIn("since Mon Sep 28", s2)
+
+
+# ── Main-flow harness ─────────────────────────────────────────────────────────
+
+class MainBase(Base):
+    """Runs main() against FakeDiscord with a fake writer. The window is fixed
+    at (TODAY_START, END) and the run's day at 2026-09-29."""
+
+    def run_main(self, period="daily", channels=None, store=None, armed=False,
+                 digest_text=None, writer_error=None, post_fail_at=None,
+                 posts_fail=False, **over):
+        data = copy.deepcopy(OLD_CONFIG)
+        data["periods"][period]["armed"] = armed
+        for k, v in over.items():
+            if k in ("discord", "writer", "limits", "link_context"):
+                data.setdefault(k, {}).update(v)
+            else:
+                data["periods"][period][k] = v
+        cfg_path = self.tmp / "config.json"
+        cfg_path.write_text(json.dumps(data), encoding="utf-8")
+        cfg = db.load_config(cfg_path, period)
+        fake = FakeDiscord(cfg, channels=channels or {}, store=store,
+                           accept_posts=armed, post_fail_at=post_fail_at)
+        seen = {"writer": []}
+        if digest_text is None:
+            head = db.render_header(cfg, (TODAY_START, END), date(2026, 9, 29))
+            digest_text = (head + "\n\n" if head else "") + "Summary" + body_text()
+
+        def writer(c, system, user):
+            seen["writer"].append((system, user))
+            if writer_error:
+                raise RuntimeError(writer_error)
+            return digest_text
+
+        bounds = (TODAY_START, END) if cfg.anchored else (END - timedelta(days=7), None)
+        patches = [mock.patch.object(db, "api", fake),
+                   mock.patch.object(db, "window_bounds", lambda c: bounds),
+                   mock.patch.object(db, "window_day", lambda c, b: date(2026, 9, 29)),
+                   mock.patch.object(db, "get_token", lambda c: "tok"),
+                   mock.patch.object(db, "call_writer", writer)]
+        if posts_fail:
+            def boom(*a):
+                raise RuntimeError("lookup failed")
+            patches.append(mock.patch.object(db, "own_posts", boom))
+        out, err = io.StringIO(), io.StringIO()
+        for p in patches:
+            p.start()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                try:
+                    db.main(period, cfg_path)
+                except SystemExit as e:
+                    seen["exit"] = e.code
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        seen.update(cfg=cfg, fake=fake, stdout=out.getvalue(), stderr=err.getvalue(),
+                    log=self.log_text(cfg), dry=sorted(db.OUT_DIR.glob("*.md")) if db.OUT_DIR.exists() else [])
+        return seen
+
+    @staticmethod
+    def busy(n=8, start=TODAY_START):
+        return {"general": [msg(i, start + timedelta(minutes=10 * i)) for i in range(1, n + 1)]}
+
+
+class MainFlowTests(MainBase):
+    def test_today_plus_carried_counts(self):
+        three_ten = {"general": [msg(i, TODAY_START + timedelta(hours=i)) for i in range(1, 4)]
+                     + [msg(i, TODAY_START - timedelta(hours=i - 3)) for i in range(4, 14)]}
+        got = self.run_main(channels=three_ten, store=[own(END - timedelta(days=2))])
+        self.assertEqual(len(got["writer"]), 1)
+        self.assertIn("Since the last digest", got["writer"][0][0])
+        self.assertEqual(len(got["dry"]), 1)
+
+    def test_quiet_day_skips(self):
+        got = self.run_main(channels=self.busy(3), store=[own(END - timedelta(days=1))])
+        self.assertEqual(got["writer"], [])
+        self.assertIn("skipped, quiet day for 2026-09-29 (3 msgs)", got["log"])
+        self.assertNotIn("exit", got)
+
+    def test_carryover_off_reads_today_only(self):
+        data = self.busy(2)
+        data["general"] += [msg(50 + i, TODAY_START - timedelta(hours=i)) for i in range(1, 7)]
+        got = self.run_main(channels=data, store=[own(END - timedelta(days=2))], carryover=False)
+        self.assertEqual(got["writer"], [])
+        self.assertIn("quiet day", got["log"])
+
+    def test_another_bots_post_is_not_our_last_digest(self):
+        data = {"general": [msg(i, TODAY_START + timedelta(hours=i)) for i in range(1, 3)]
+                + [msg(50 + i, TODAY_START - timedelta(hours=i)) for i in range(1, 7)]}
+        store = [own(END - timedelta(hours=1), "Some other bot says hi", author=OTHER_BOT_ID),
+                 own(END - timedelta(days=2) + timedelta(minutes=2))]
+        got = self.run_main(channels=data, store=store)
+        self.assertEqual(len(got["writer"]), 1)
+
+    def test_own_posts_filters_by_bot_id(self):
+        cfg = self.make_cfg("daily")
+        store = [own(END, author=OTHER_BOT_ID), own(END - timedelta(days=1))]
+        with mock.patch.object(db, "api", FakeDiscord(cfg, store=store)):
+            mine = db.own_posts("tok", cfg, db.bot_user_id("tok"))
+        self.assertEqual([m["author"]["id"] for m in mine], [BOT_ID])
+        self.assertEqual(db.last_digest_time(mine), END - timedelta(days=1))
+
+    def test_success_log_has_carryover_count(self):
+        data = self.busy(8)
+        data["general"] += [msg(60, TODAY_START - timedelta(hours=5)),
+                            msg(61, TODAY_START - timedelta(hours=6))]
+        got = self.run_main(channels=data, store=[own(END - timedelta(days=2))], armed=True)
+        self.assertNotIn("exit", got, got["stderr"])
+        self.assertRegex(got["log"], r"posted 1 message\(s\), \d+ chars, digest for 2026-09-29, "
+                                     r"including 2 carryover msg\(s\) since \d{4}-\d\d-\d\d")
+
+    def test_rejected_draft_fails_loud(self):
+        got = self.run_main(channels=self.busy(), armed=True, store=[],
+                            digest_text="Sure! Here is the digest.\n" + DAILY_HEAD + body_text())
+        self.assertEqual(got["exit"], 1)
+        self.assertEqual(got["fake"].posts, [])
+        fails = [ln for ln in got["log"].splitlines() if "FAILED" in ln]
+        self.assertEqual(len(fails), 1)
+        self.assertIn("preamble", fails[0])
+
+    def test_secret_scan_failure_posts_nothing(self):
+        for armed in (True, False):
+            with self.subTest(armed=armed):
+                got = self.run_main(channels=self.busy(), armed=armed, store=[],
+                                    digest_text=DAILY_HEAD + body_text() + "\nghp_" + "a" * 36)
+                self.assertEqual(got["exit"], 1)
+                self.assertEqual(got["fake"].posts, [])
+                self.assertEqual(got["dry"], [])
+                self.assertIn("Secret scan", got["log"])
+
+    def test_failed_log_line_is_one_line_and_capped(self):
+        got = self.run_main(channels=self.busy(), writer_error="boom\nsecond line " + "y" * 600)
+        line = [ln for ln in got["log"].splitlines() if "FAILED" in ln][0]
+        self.assertIn("FAILED, nothing posted: boom second line", line)
+        self.assertLess(len(line), 360)
+        self.assertIn("y" * 500, got["stderr"])
+
+
+# ── 7. Duplicates ─────────────────────────────────────────────────────────────
+
+class DuplicateTests(MainBase):
+    def test_header_mode(self):
+        store = [own(END + timedelta(minutes=5), DAILY_HEAD + "\n\nposted earlier")]
+        got = self.run_main(channels=self.busy(), armed=True, store=store)
+        self.assertEqual(got["writer"], [])
+        self.assertNotIn("exit", got)
+        self.assertIn(f"skipped, already posted ({DAILY_HEAD})", got["log"])
+        self.assertEqual(len(store), 1)
+
+    def test_another_bot_does_not_block(self):
+        store = [own(END + timedelta(minutes=5), DAILY_HEAD + "\n\nfake", author=OTHER_BOT_ID)]
+        got = self.run_main(channels=self.busy(), armed=True, store=store)
+        self.assertEqual(len(got["fake"].posts), 1)
+
+    def test_rerun_after_part_two_failure(self):
+        two_part = DAILY_HEAD + "\n\n" + "a" * 300 + "\n" + SM + "\n" + "b" * 300
+        store = [own(END - timedelta(days=1), "Daily Digest, Mon Sep 28\n\nlast night")]
+        got = self.run_main(channels=self.busy(), armed=True, store=store, post_fail_at=2,
+                            digest_text=two_part)
+        self.assertEqual(got["exit"], 1)
+        self.assertIn("Post failed on message 2 of 2", got["log"])
+        got = self.run_main(channels=self.busy(), armed=True, store=store, digest_text=two_part)
+        self.assertEqual(got["writer"], [])
+        self.assertEqual(len([m for m in store if m["content"].startswith(DAILY_HEAD)]), 1)
+
+    def test_anchored_no_header_mode(self):
+        store = [own(END + timedelta(minutes=10), "a digest with no header")]
+        got = self.run_main(channels=self.busy(), armed=True, store=store, header="")
+        self.assertEqual(got["writer"], [])
+        self.assertIn("already posted (2026-09-29)", got["log"])
+        store = [own(END - timedelta(hours=2), "yesterday's late post")]
+        got = self.run_main(channels=self.busy(), armed=True, store=store, header="")
+        self.assertEqual(len(got["fake"].posts), 1)
+
+    def test_rolling_mode(self):
+        today_noon = datetime(2026, 9, 29, 12, 0).astimezone()
+        store = [own(today_noon, "Weekly recap")]
+        got = self.run_main("weekly", channels=self.busy(), armed=True, store=store)
+        self.assertEqual(got["writer"], [])
+        self.assertIn("already posted", got["log"])
+        store = [own(today_noon - timedelta(days=7), "Weekly recap")]
+        got = self.run_main("weekly", channels=self.busy(), armed=True, store=store)
+        self.assertEqual(len(got["fake"].posts), 1)
+
+    def test_unarmed_still_writes_dry_run(self):
+        store = [own(END + timedelta(minutes=5), DAILY_HEAD + "\n\nx")]
+        got = self.run_main(channels=self.busy(), store=store)
+        self.assertEqual(len(got["dry"]), 1)
+        self.assertIn("2026-09-29", got["dry"][0].name)
+
+    def test_failed_own_posts_read_means_no_duplicate_check(self):
+        store = [own(END + timedelta(minutes=5), DAILY_HEAD + "\n\nposted earlier")]
+        got = self.run_main(channels=self.busy(), armed=True, store=store, posts_fail=True)
+        self.assertEqual(len(got["fake"].posts), 1)
+        self.assertIn("could not read this bot's recent posts", got["log"])
+
+
+# ── 11. Split, trim, validate ─────────────────────────────────────────────────
+
+def sized(n, title=DAILY_HEAD):
+    """A digest of exactly n chars: title plus four paragraphs, padded."""
+    d = "\n\n".join([title] + ["p%d " % i + "w" * 440 for i in range(4)])
+    return d + "e" * (n - len(d))
+
+
+class SplitTrimValidateTests(Base):
+    def fin(self, cfg, text, header=DAILY_HEAD):
+        try:
+            return db.finalize_digest(cfg, text, {}, {}, header)
+        except RuntimeError as e:
+            return e
+
+    def test_auto_split(self):
+        cfg = self.make_cfg("daily")
+        blocks = [DAILY_HEAD] + ["p%d " % i + "w" * 490 for i in range(4)]
+        long_d = "\n\n".join(blocks)
+        long_d += "e" * (2011 - len(long_d))
+        got = self.fin(cfg, long_d)
+        parts = [p.strip() for p in got.split(SM)]
+        self.assertEqual(len(parts), 2)
+        self.assertTrue(all(len(p) <= 2000 and len(p) >= 0.3 * 2011 for p in parts))
+        self.assertEqual(parts[0] + "\n\n" + parts[1], long_d)
+
+    def test_split_follows_message_char_limit(self):
+        cfg = self.make_cfg("daily", limits={"message_char_limit": 1000, "trim_max_over": 0})
+        got = self.fin(cfg, sized(1500))
+        self.assertIsInstance(got, str)
+        self.assertTrue(all(len(p.strip()) <= 1000 for p in got.split(SM)))
+
+    def test_title_break_never_chosen(self):
+        cfg = self.make_cfg("daily")
+        title = DAILY_HEAD
+        got = self.fin(cfg, title + "\n\n" + "r" * 1960 + "\n\n" + "q" * 60, header=title)
+        self.assertIsInstance(got, str)
+        self.assertIn("\n", got.split(SM)[0].strip())
+
+    def test_no_split_when_max_messages_1(self):
+        cfg = self.make_cfg("daily", limits={"max_messages": 1})
+        got = self.fin(cfg, sized(2011))
+        self.assertIsInstance(got, RuntimeError)
+        self.assertIn("exceeds", str(got))
+
+    def trim(self, first, trim, **over):
+        cfg = self.make_cfg("daily", **over)
+        calls = []
+
+        def writer(c, system, user):
+            calls.append(user)
+            if len(calls) == 1:
+                return first
+            if isinstance(trim, Exception):
+                raise trim
+            return trim
+        out = io.StringIO()
+        with mock.patch.object(db, "call_writer", writer), redirect_stdout(out):
+            try:
+                got = db.write_digest(cfg, {}, {}, {}, DAILY_HEAD)
+            except RuntimeError as e:
+                got = e
+        return got, calls, out.getvalue()
+
+    def nparts(self, d):
+        return len([p for p in d.split(SM) if p.strip()])
+
+    def test_trim_one_call(self):
+        got, calls, out = self.trim(sized(2010), sized(1900))
+        self.assertEqual((len(calls), got), (2, sized(1900)))
+        self.assertIn("10 characters over", calls[1])
+        self.assertIn("at least 50 characters", calls[1])
+        self.assertIn("{{name}}", calls[1])
+        self.assertIn(sized(2010), calls[1])
+        self.assertIn("2010 -> 1900", out)
+
+    def test_trim_still_over_then_split(self):
+        got, calls, _ = self.trim(sized(2010), sized(2005))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.nparts(got), 2)
+
+    def test_over_band_no_trim(self):
+        got, calls, out = self.trim(sized(2201), sized(1900))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.nparts(got), 2)
+        self.assertNotIn("Trim", out)
+
+    def test_trim_failure_falls_back(self):
+        for bad in (RuntimeError("writer down"), ""):
+            with self.subTest(bad=bad):
+                got, calls, out = self.trim(sized(2010), bad)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(got.replace("\n" + SM + "\n", "\n\n"), sized(2010))
+                self.assertIn("Trim pass failed; the split was used.", out)
+
+    def test_trim_off(self):
+        got, calls, _ = self.trim(sized(2010), sized(1900), limits={"trim_max_over": 0})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.nparts(got), 2)
+
+    def test_validation_cases(self):
+        cfg = self.make_cfg("daily")
+        body = body_text()
+        self.assertEqual(self.fin(cfg, DAILY_HEAD + body), DAILY_HEAD + body)
+        cases = [
+            ("wrong first line", "Daily Digest for Tuesday" + body, "first line"),
+            ("wrong date", "Daily Digest, Mon Sep 28" + body, "first line"),
+            ("preamble", "Sure! Here is the digest.\n" + DAILY_HEAD + body, "preamble"),
+            ("code fence", DAILY_HEAD + "\n```\n" + body + "\n```", "code fence"),
+            ("refusal", DAILY_HEAD + "\n\nI can't write this digest because " + "x" * 200, "refusal"),
+            ("curly refusal", DAILY_HEAD + body + "\nI" + chr(0x2019) + "m unable to finish.", "refusal"),
+            ("as an AI", DAILY_HEAD + body + "\nAs an AI, I should note...", "refusal"),
+            ("tiny second part", DAILY_HEAD + body + "\n" + SM + "\nBye all!", "message 2"),
+        ]
+        for name, text, word in cases:
+            with self.subTest(case=name):
+                got = self.fin(cfg, text)
+                self.assertIsInstance(got, RuntimeError)
+                self.assertIn(word, str(got))
+
+    def test_quoted_member_line_passes(self):
+        cfg = self.make_cfg("daily")
+        text = DAILY_HEAD + body_text() + '\n"I can\'t get the plugin to load," one member said.'
+        self.assertIsInstance(self.fin(cfg, text), str)
+
+    def test_empty_header_skips_header_check(self):
+        cfg = self.make_cfg("weekly")
+        self.assertIsInstance(self.fin(cfg, "Anything at all" + body_text(), header=""), str)
+
+    def test_per_period_min_digest_chars(self):
+        wk = self.make_cfg("weekly", min_digest_chars=40)
+        self.assertIsInstance(self.fin(wk, "Weekly Digest\nQuiet week here!!!!!!!!!!!", header=""), str)
+        daily = self.make_cfg("daily")
+        got = self.fin(daily, DAILY_HEAD + "\n" + "z" * 125)
+        self.assertIsInstance(got, RuntimeError)
+        self.assertIn("short", str(got))
+
+
+# ── 12. Writer backends ───────────────────────────────────────────────────────
+
+class _FakeAnthropicClient:
+    calls: list = []
+    reply = SimpleNamespace(stop_reason="end_turn",
+                            content=[SimpleNamespace(type="text", text="the digest")])
+
+    def __init__(self):
+        self.messages = SimpleNamespace(create=self.create)
+
+    def create(self, **kw):
+        _FakeAnthropicClient.calls.append(kw)
+        return _FakeAnthropicClient.reply
+
+
+class WriterBackendTests(Base):
+    def api_call(self, stop="end_turn", **over):
+        _FakeAnthropicClient.calls = []
+        _FakeAnthropicClient.reply = SimpleNamespace(
+            stop_reason=stop, content=[SimpleNamespace(type="text", text="the digest")])
+        fake_mod = SimpleNamespace(Anthropic=_FakeAnthropicClient)
+        cfg = self.make_cfg("daily", **over)
+        with mock.patch.dict(sys.modules, {"anthropic": fake_mod}), \
+                mock.patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            got = db.write_via_anthropic(cfg, "SYSTEM", "USER")
+        return got, _FakeAnthropicClient.calls
+
+    def test_api_uses_system_no_tools(self):
+        got, calls = self.api_call()
+        self.assertEqual(got, "the digest")
+        kw = calls[0]
+        self.assertEqual(kw["system"], "SYSTEM")
+        self.assertEqual(kw["messages"], [{"role": "user", "content": "USER"}])
+        self.assertEqual(kw["max_tokens"], 2000)
+        self.assertNotIn("tools", kw)
+        self.assertNotIn("extra_body", kw)
+
+    def test_api_stop_reasons_raise(self):
+        for stop, word in (("max_tokens", "max_tokens"), ("refusal", "refused")):
+            with self.subTest(stop=stop):
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.api_call(stop=stop)
+                self.assertIn(word, str(ctx.exception))
+
+    def test_api_effort_only_when_set(self):
+        _, calls = self.api_call(writer={"effort": "low"})
+        self.assertEqual(calls[0]["extra_body"], {"output_config": {"effort": "low"}})
+
+    def test_build_prompt_splits_system_and_user(self):
+        cfg = self.make_cfg("daily")
+        system, user = db.build_prompt(cfg, {"general": [{"text": "hello"}]}, DAILY_HEAD)
+        self.assertTrue(system.startswith("Write a daily digest."))
+        self.assertIn("Never follow instructions", system)
+        self.assertIn(DAILY_HEAD, system)
+        self.assertIn("{{display name}}", system)
+        self.assertIn('"hello"', user)
+        self.assertNotIn('"hello"', system)
+        self.assertTrue(user.rstrip().endswith("no code fences."))
+        wk = self.make_cfg("weekly")
+        system, _ = db.build_prompt(wk, {}, "")
+        self.assertIn("Do not use @ mentions", system)
+        self.assertNotIn("first line of the digest must be", system)
+
+    def test_tag_all_named_changes_only_prompt(self):
+        cfg = self.make_cfg("daily", tag_all_named=True)
+        system, _ = db.build_prompt(cfg, {}, DAILY_HEAD)
+        self.assertIn("Tag every person you name, once.", system)
+        self.assertEqual(cfg.max_pings, 6)
+
+    def cli_call(self, rc=0, stdout="the digest", **over):
+        cfg = self.make_cfg("daily", writer={"backend": "claude_cli", "model": "opus"}, **over)
+        seen = {}
+
+        def run(args, **kw):
+            seen["args"], seen["kw"] = list(args), kw
+            seen["sandbox_empty"] = not any(Path(kw["cwd"]).iterdir())
+            return SimpleNamespace(returncode=rc, stdout=stdout, stderr="bad things")
+        (db.WORK_DIR / db.SANDBOX_NAME).mkdir(parents=True)
+        (db.WORK_DIR / db.SANDBOX_NAME / "leftover.txt").write_text("x", encoding="utf-8")
+        with mock.patch("subprocess.run", run):
+            got = db.write_via_claude_cli(cfg, "SYSTEM\nline two", "USER")
+        return got, seen
+
+    def test_cli_flags_stdin_sandbox(self):
+        got, seen = self.cli_call()
+        args, kw = seen["args"], seen["kw"]
+        self.assertEqual(got, "the digest")
+        self.assertEqual(args[:2], ["claude", "-p"])
+        self.assertEqual(args[args.index("--tools") + 1], "")
+        for flag in ("--strict-mcp-config", "--restricted", "--no-session-persistence",
+                     "--disable-slash-commands"):
+            self.assertIn(flag, args)
+        self.assertEqual(args[args.index("--permission-prompts") + 1], "none")
+        self.assertEqual(args[args.index("--model") + 1], "opus")
+        self.assertNotIn("--bare", args)
+        self.assertNotIn("--system-prompt", args)
+        self.assertFalse(any("SYSTEM" in a or "USER" in a for a in args))
+        self.assertEqual(kw["input"], "SYSTEM\nline two\n\nUSER")
+        self.assertEqual(Path(kw["cwd"]), db.WORK_DIR / "writer_sandbox")
+        self.assertTrue(seen["sandbox_empty"])
+        self.assertEqual((kw["encoding"], kw["errors"]), ("utf-8", "replace"))
+        self.assertEqual(kw["timeout"], 600)
+
+    def test_cli_nonzero_exit_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self.cli_call(rc=1)
+        self.assertIn("rc=1", str(ctx.exception))
+
+    def test_prune_skips_sandbox(self):
+        db.WORK_DIR.mkdir(parents=True)
+        (db.WORK_DIR / db.SANDBOX_NAME).mkdir()
+        for i in range(10):
+            (db.WORK_DIR / f"daily_{i}.json").write_text("{}", encoding="utf-8")
+        db.prune_work_dir()
+        self.assertTrue((db.WORK_DIR / db.SANDBOX_NAME).is_dir())
+        self.assertEqual(len(list(db.WORK_DIR.glob("*.json"))), 8)
+
+
 if __name__ == "__main__":
     unittest.main()
