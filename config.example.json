@@ -7,12 +7,14 @@
       "introductions",
       "showcase",
       "help"
-    ]
+    ],
+    "read_threads": true
   },
   "writer": {
     "backend": "anthropic",
-    "model": "YOUR_WRITER_MODEL_ID",
-    "max_tokens": 2000,
+    "model": "claude-opus-5-5",
+    "max_tokens": 16000,
+    "timeout_seconds": 600,
     "claude_cli_path": "claude"
   },
   "limits": {
@@ -20,7 +22,17 @@
     "message_char_limit": 2000,
     "max_messages": 2,
     "min_digest_chars": 200,
-    "max_fetch_per_channel": 1000
+    "max_fetch_per_channel": 1000,
+    "target_chars": 1600,
+    "trim_max_over": 200,
+    "min_part_chars": 40
+  },
+  "link_context": {
+    "enabled": false,
+    "max_links": 8,
+    "timeout_seconds": 10,
+    "max_bytes": 200000,
+    "summary_chars": 2500
   },
   "periods": {
     "weekly": {
@@ -29,9 +41,11 @@
       "window_days": 7,
       "anchored": false,
       "min_messages": 0,
+      "min_digest_chars": 40,
       "resolve_mentions": false,
+      "header": "Weekly Digest, {range}",
       "channel_name": "#weekly-digest",
-      "digest_instructions": "You are writing a friendly weekly digest of a Discord community. You will be given one week of messages grouped by channel. Summarize the week's highlights: notable discussions, questions answered, wins, and new members. Write warm, concise prose in short paragraphs. Do not invent anything not in the messages. If the digest would exceed a single Discord message of 2000 characters, split it into at most two messages by placing the exact line =====SPLIT===== on its own line at the split point. Do not use @ mentions or channel links."
+      "digest_instructions": "You are writing a friendly weekly digest of a Discord community. You will be given one week of messages grouped by channel. Summarize the week's highlights: notable discussions, questions answered, wins, and new members. Write warm, concise prose in short paragraphs. Do not invent anything not in the messages. Every item must make sense to a member who wasn't there. Never repeat a claim as fact, and never pass along jargon you can't explain. Describe what a shared thing does in plain words a newcomer would follow. Drop slogans and big claims. Use people's own words for what they built. Credit each person for their own work. Report complaints kindly. Explain a tool by what it checks, does, or blocks, in one plain sentence. Report one person's opinion as what they said. Add no advice nobody gave. If the week was quiet, write the header line, then one plain line saying it was a quiet week, an invitation to post, and a signoff."
     },
     "daily": {
       "digest_channel_id": "YOUR_DAILY_DIGEST_CHANNEL_ID",
@@ -39,10 +53,16 @@
       "window_days": 1,
       "anchored": true,
       "anchor_hour": 23,
+      "anchor_grace_minutes": 30,
       "min_messages": 8,
+      "carryover": true,
+      "max_carry_days": 7,
+      "max_quiet_runs": 3,
       "resolve_mentions": true,
+      "tag_all_named": false,
+      "header": "Daily Digest, {date}",
       "channel_name": "#daily-digest",
-      "digest_instructions": "You are writing a friendly daily digest of a Discord community. You will be given the last 24 hours of messages grouped by channel. Summarize the day's highlights in short, warm paragraphs. Do not invent anything not in the messages. To mention a person, write their display name in double braces like {{Alex}}; to link a channel, write {{#channel-name}}. Do not write raw Discord IDs. If the digest would exceed a single Discord message of 2000 characters, split it into at most two messages by placing the exact line =====SPLIT===== on its own line at the split point."
+      "digest_instructions": "You are writing a friendly daily digest of a Discord community. You will be given the last 24 hours of messages grouped by channel. Summarize the day's highlights in short, warm paragraphs. Do not invent anything not in the messages. Every item must make sense to a member who wasn't there. Never repeat a claim as fact, and never pass along jargon you can't explain. Describe what a shared thing does in plain words a newcomer would follow. Drop slogans and big claims. Use people's own words for what they built. Credit each person for their own work. Report complaints kindly. Explain a tool by what it checks, does, or blocks, in one plain sentence. Report one person's opinion as what they said. Add no advice nobody gave. To mention a person, write their display name in double braces like {{Alex}}; to link a channel, write {{#channel-name}}. Do not write raw Discord IDs."
     }
   }
 }
