@@ -3,20 +3,24 @@
 
 One engine, two periods, selected by --period (default weekly):
   weekly  reads a rolling window (default 7 days) and posts to a digest channel.
-  daily   reads an anchored window (yesterday's anchor hour -> today's anchor
-          hour) and posts to a digest channel, skipping genuinely quiet days.
+  daily   reads an anchored window that ends at the most recent anchor hour
+          (with a short grace, so a late run covers the day it missed),
+          carries over skipped quiet days, and skips genuinely quiet days.
 
 Pipeline (both periods):
-  1. Read the period's window of messages from the configured read channels
-     via the Discord REST API.
-  2. Hand the raw JSON to an LLM writer (Anthropic API by default, or the
-     Claude Code CLI as an alternative) to write the digest per the format
-     instructions in config.
-  3. Validate, then either POST to the digest channel (armed: true) or write a
+  1. Skip if this bot already posted this period's digest.
+  2. Read the period's window of messages from the configured read channels
+     and their active threads via the Discord REST API.
+  3. Optionally fetch posted links for context (link_context, off by default).
+  4. Hand the messages to an LLM writer (Anthropic API by default, or the
+     Claude Code CLI with no tools) to write the digest per the instructions
+     in config plus the engine's own rules.
+  5. Contain pings, trim or split if long, validate the shape, scan for
+     secrets, then either POST to the digest channel (armed: true) or write a
      dry-run file under ./out (armed: false).
 
-Failure rule: a broken or invalid digest never posts. The run logs the failure
-under ./logs and exits nonzero.
+Failure rule: a broken or invalid digest never posts. The run logs one FAILED
+line under ./logs and exits nonzero.
 
 Everything server-specific lives in a JSON config file (see config.example.json).
 Nothing about any particular Discord server is baked into this file.

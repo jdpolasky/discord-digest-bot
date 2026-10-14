@@ -219,6 +219,14 @@ class ConfigTests(Base):
             cfg = db.load_config(ex, period)
             self.assertEqual(cfg.period, period)
             self.assertTrue(cfg.digest_instructions)
+            self.assertNotIn(SM, cfg.digest_instructions)
+        wk, dy = db.load_config(ex, "weekly"), db.load_config(ex, "daily")
+        self.assertEqual((wk.min_digest_chars, wk.min_messages, wk.header), (40, 0, "Weekly Digest, {range}"))
+        self.assertEqual((dy.header, dy.anchor_grace_minutes, dy.max_quiet_runs), ("Daily Digest, {date}", 30, 3))
+        self.assertTrue(dy.carryover and not dy.tag_all_named)
+        self.assertEqual((wk.writer_model, wk.writer_max_tokens), ("claude-opus-5-5", 16000))
+        self.assertFalse(wk.link_enabled)
+        self.assertNotIn("Do not use @ mentions", wk.digest_instructions)
 
     def test_missing_period_is_a_clear_error(self):
         path = self.tmp / "c.json"
