@@ -245,7 +245,7 @@ class HygieneTests(unittest.TestCase):
             text = (ROOT / name).read_text(encoding="utf-8")
             with self.subTest(file=name):
                 self.assertIsNone(re.search(r"(?<!\d)\d{17,20}(?!\d)", text))
-                for bad in ("Users" + "\\", "/home/", "sk-" + "ant-"):
+                for bad in ("Users" + "\\", "/" + "home/", "sk-" + "ant-"):
                     self.assertFalse(bad in text, f"{name} contains {bad!r}")
 
 
